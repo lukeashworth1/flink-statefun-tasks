@@ -1,5 +1,5 @@
-from ._serialisation import _dumps, _loads
-from .messages_pb2 import TaskState, TaskResult
+from ._serialisation import DefaultSerialiser
+from .messages_pb2 import TaskState
 
 from google.protobuf.any_pb2 import Any
 from statefun import kafka_egress_record
@@ -9,14 +9,15 @@ from typing import Callable
 
 
 class _TaskContext(object):
-    def __init__(self, context: BatchContext, task_name: str, egress_type_name: str):
+    def __init__(self, context: BatchContext, task_name: str, egress_type_name: str, serialiser=None):
         self._context = context
         self._task_name = task_name
         self._egress_type_name = egress_type_name
+        self._serialiser = serialiser if serialiser is not None else DefaultSerialiser()
 
         try:
             task_state = self.unpack('task_state', TaskState)
-            self._state = _loads(task_state.data)
+            self._state = self._serialiser.from_proto(task_state.data)
         except:
             self._state = {}
 
@@ -57,6 +58,9 @@ class _TaskContext(object):
         egress_message = kafka_egress_record(topic=topic, value=any)
         self._context.pack_and_send_egress(self._egress_type_name, egress_message)
 
+    def delete(self, key):
+        del self._context[key]
+
     def set_state(self, data:dict):
         self._state = data
 
@@ -66,16 +70,11 @@ class _TaskContext(object):
     def update_state(self, updates:dict):
         self._state.update(updates)
 
-    def pack_and_update_state(self, key, value):
-        any = Any()
-        any.Pack(value)
-        self._state.update({key: any})
-
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        task_state = TaskState(type='statefun_tasks.task_state', data=_dumps(self._state))
+        task_state = TaskState(data=self._serialiser.to_proto(self._state))
         self.pack_and_save('task_state', task_state)
 
     def __str__(self):

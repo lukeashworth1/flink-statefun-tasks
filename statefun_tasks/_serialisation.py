@@ -1,89 +1,130 @@
-from .messages_pb2 import TaskRequest, TaskResult, TaskException
-from ._types import _GroupResult
-
-import json
-import pickle
-from typing import Union
-
-
-def _dumps(data):
-    return pickle.dumps(data)
+from .messages_pb2 import TaskRequest, TaskResult, TaskException, ArgsAndKwargs
+from ._protobuf import _convert_from_proto, _convert_to_proto, _pack_any, _unpack_any, _parse_any_from_bytes
+from ._utils import _is_tuple
+from google.protobuf.any_pb2 import Any
+from google.protobuf.message import Message
 
 
-def _loads(data):
-    return pickle.loads(data)
+class DefaultSerialiser(object):
+    """
+    Default protobuf serialiser for Flink Tasks
+    
+    :param known_proto_types: an array of known protobuf types that will not be packed inside Any
+    """
+    def __init__(self, known_proto_types=[]):
+        self._known_proto_types = set(known_proto_types)
 
+    def register_proto_types(self, proto_types):
+        self._known_proto_types.update(proto_types)
 
-def deserialise(task_object: Union[TaskRequest, TaskResult, _GroupResult]):
-    content_type = task_object.content_type
+    def to_proto(self, item) -> Message:
+        """
+        Converts from Python to protobuf
+        
+        :param item: the item to convert
+        :return: the protobuf message possibly packed in an Any
+        """
+        return _convert_to_proto(item)
 
-    if task_object.data is None or len(task_object.data) == 0:
-        return None
+    def from_proto(self, proto: Message, default=None):
+        """
+        Converts from protobuf to Python
+        
+        :param proto: the protobuf message
+        :param option default: an optional default value to return
+        :return: the Python type or default value if deserialisation return None
+        """
+        result = _convert_from_proto(proto, self._known_proto_types)
+        return result if result is not None else default
 
-    if content_type is None:
-        raise ValueError('Missing content_type')
+    def serialise_args_and_kwargs(self, args, kwargs) -> Any:
+        """
+        Serialises Python args and kwargs into protobuf
+        
+        If there is a single arg and no kwargs and the arg is already a protobuf it returns
+        that instance packed inside an Any.  Otherwise it returns an ArgsAndKwargs packed in an Any.
 
-    if content_type not in [
-        'application/json',
-        'application/python-pickle',
-        'application/octect-stream'
-        ]:
-        raise ValueError(f'Unsupported content_type {content_type}')
+        :param args: the Python args
+        :param kwargs: the Python kwargs
+        :return: protobuf Any
+        """
 
-    if content_type.lower() == 'application/json':
-        return json.loads(task_object.data.decode('utf-8'))
-
-    if content_type.lower() == 'application/python-pickle':
-        return pickle.loads(task_object.data)
-
-    if content_type.lower() == 'application/octect-stream':
-        return task_object.data
-
-    raise ValueError(f'Unhandled content_type {content_type}')
-
-
-def deserialise_result(task_result: TaskResult):
-    data = deserialise(task_result)
-    if isinstance(data, (list, tuple)) and len(data) == 1:
-        # single results are still returned as single element list/tuple and are thus unpacked
-        return data[0]
-    else:
-        return data
-
-
-def serialise(task_object: Union[TaskRequest, TaskResult], data, content_type: str):
-    if content_type is None:
-        raise ValueError('Missing content_type')
-
-    if content_type not in [
-        'application/json',
-        'application/python-pickle',
-        'application/octect-stream'
-        ]:
-        raise ValueError(f'Unsupported content_type {content_type}')
-
-    task_object.content_type = content_type
-
-    if task_object.data is None or len(task_object.data) == 0:
-        task_object.data = bytes()
-
-    if content_type.lower() == 'application/json':
-        task_object.data = json.dumps(data).encode('utf-8')
-
-    elif content_type.lower() == 'application/python-pickle':
-        task_object.data = pickle.dumps(data)
-
-    elif content_type.lower() == 'application/octect-stream':
-        if isinstance(data, bytes):
-            task_object.data = data
+        # if kwargs are empty and this is a single protobuf arguments then 
+        # send in simple format i.e. fn(protobuf) -> protobuf as opposed to fn(*args, **kwargs) -> (*results,)
+        # so as to aid calling flink functions written in other frameworks that might not understand
+        # how to deal with the concept of keyword arguments or tuples of arguments
+        if isinstance(args, Message) and not kwargs:
+            request = args
         else:
-            raise ValueError('Expected bytes')
-    else:
-        raise ValueError(f'Unhandled content_type {content_type}')
+            args = args if _is_tuple(args) else (args,)
+            request = ArgsAndKwargs()
+            request.args.CopyFrom(_convert_to_proto(args))
+            request.kwargs.CopyFrom(_convert_to_proto(kwargs))
 
+        return _pack_any(request)
 
-def try_serialise_json_then_pickle(task_object: Union[TaskRequest, TaskResult], data):
-    try:
-        serialise(task_object, data, content_type='application/json')
-    except:
-        serialise(task_object, data, content_type='application/python-pickle')
+    def deserialise_args_and_kwargs(self, request: Any):
+        """
+        Deserialises Any into args and kwargs
+        
+        :param request: the protobuf message
+        :return: tuple of args and kwargs
+        """
+        request = _convert_from_proto(request, self._known_proto_types)
+
+        if isinstance(request, ArgsAndKwargs):
+            args = _convert_from_proto(request.args, self._known_proto_types)
+            kwargs = _convert_from_proto(request.kwargs, self._known_proto_types)
+        else:
+            args = request
+            kwargs = {}
+
+        return args, kwargs
+
+    def serialise_request(self, task_request: TaskRequest, args, kwargs, state=None):
+        """
+        Serialises args, kwargs and optional state into a TaskRequest
+        
+        :param task_request: the TaskRequest
+        :param args: task args
+        :param kwargs: task kwargs
+        :param optional state: task state
+        """
+        request = self.serialise_args_and_kwargs(args, kwargs)
+        task_request.request.CopyFrom(request)
+        task_request.state.CopyFrom(_pack_any(_convert_to_proto(state)))
+
+    def deserialise_request(self, task_request: TaskRequest):
+        """
+        Dserialises a TaskRequest back into args, kwargs and state
+        
+        :param task_request: the TaskRequest
+        :return: tuple of task args, kwargs and state
+        """
+        args, kwargs = self.deserialise_args_and_kwargs(task_request.request)
+
+        state = _convert_from_proto(task_request.state, self._known_proto_types)
+        return args, kwargs, state
+
+    def serialise_result(self, task_result: TaskResult, result, state):
+        """
+        Serialises the result of a task invocation into a TaskResult
+        
+        :param task_result: the TaskResult
+        :param result: task result
+        :param state: task state
+        """
+        task_result.result.CopyFrom(_pack_any(_convert_to_proto(result)))
+        task_result.state.CopyFrom(_pack_any(_convert_to_proto(state)))
+
+    def deserialise_result(self, task_result: TaskResult):
+        """
+        Dserialises a TaskResult back into result and state
+        
+        :param task_result: the TaskResult
+        :return: tuple of result and state
+        """
+        result = _convert_from_proto(task_result.result, self._known_proto_types)
+        state = _convert_from_proto(task_result.state, self._known_proto_types)
+
+        return result, state

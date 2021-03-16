@@ -1,165 +1,67 @@
-from ._utils import _gen_id, _task_type_for, _try_next, _is_tuple
-from ._serialisation import deserialise, deserialise_result, serialise, try_serialise_json_then_pickle
-from ._types import _TaskEntry, _GroupEntry, _GroupResult
+from ._utils import _gen_id, _task_type_for, _is_tuple
+from ._serialisation import DefaultSerialiser
+from ._types import _TaskEntry, _GroupEntry, RetryPolicy
 from ._context import _TaskContext
-from .messages_pb2 import TaskRequest, TaskResult, TaskException
-from functools import partial
+from ._pipeline_utils import _get_initial_tasks, _mark_task_complete, _get_task_entry, _get_next_step_in_pipeline, \
+    _extend_args, _save_task_result_or_exception, _aggregate_group_results, _try_get_finally_task
+from .messages_pb2 import TaskRequest, TaskResult, TaskException, GroupEntry, TaskEntry, Pipeline
 
-from datetime import timedelta
 from typing import Union, Iterable
 from uuid import uuid4
 
 
 class _Pipeline(object):
-    def __init__(self, pipeline: list):
+    def __init__(self, pipeline: list, serialiser=None):
         self._pipeline = pipeline
+        self._serialiser = serialiser if serialiser is not None else DefaultSerialiser()
 
-    def begin(self, context: _TaskContext, extra_args):
+    def to_proto(self) -> Pipeline:
+        pipeline = Pipeline(entries=[p.to_proto(self._serialiser) for p in self._pipeline])
+        return pipeline
+
+    @staticmethod
+    def from_proto(pipeline_proto: Pipeline, serialiser):
+        pipeline = []
+
+        for proto in pipeline_proto.entries:
+            if proto.HasField('task_entry'):
+                pipeline.append(_TaskEntry.from_proto(proto, serialiser))
+            elif proto.HasField('group_entry'):
+                pipeline.append(_GroupEntry.from_proto(proto, serialiser))
+
+        return _Pipeline(pipeline, serialiser)
+        
+
+    def begin(self, context: _TaskContext):
         # 1. record all the continuations into a pipeline and save into state with caller id and address
+
         state = {
-            'pipeline': self._pipeline,
+            'pipeline': self.to_proto(),
+            'address': context.get_address(),
             'caller_id': context.get_caller_id(),
-            'address': context.get_address()
+            'caller_address': context.get_caller_address()
         }
 
         context.set_state(state)
 
         # 2. get initial tasks(s) to call - might be single start of chain task or a group of tasks to call in parallel
-        tasks = self._get_initial_tasks(self._pipeline[0])
+        tasks = _get_initial_tasks(self._pipeline[0])
 
         # 3. call each task
         for task in tasks:
 
-            task_id, task_type, args, kwargs = task.to_tuple()
-            # merge args and extra_args
-            args = args + extra_args
+            task_id, task_type, args, kwargs, parameters = task.to_tuple()
+            request = TaskRequest(id=task_id, type=task_type, parameters=self._serialiser.to_proto(parameters))
+            self._serialiser.serialise_request(request, args, kwargs)
 
-            task_data = (args, kwargs)
-
-            request = TaskRequest(id=task_id, type=task_type)
-            serialise(request, task_data, content_type=task.get_parameter('content_type'))
-
-            destination = self._get_destination(task)
-            context.pack_and_send(destination, task_id, request)
-
-    def _get_initial_tasks(self, entry):
-        tasks = []
-        if isinstance(entry, _GroupEntry):
-            for t in entry:
-                tasks.extend(self._get_initial_tasks(t[0]))
-        elif isinstance(entry, _TaskEntry):
-            tasks.append(entry)
-        else:
-            raise ValueError(f'Expected either a task or a group at the start of each pipeline')
-
-        return tasks
-
-    def _get_destination(self, task: _TaskEntry):
-        # task destination of form 'namespace/worker_name'
-        return f'{task.get_parameter("namespace")}/{task.get_parameter("worker_name")}'
-
-    def _get_task_entry(self, task_id, pipeline=None):
-        for entry in self._pipeline if pipeline is None else pipeline:
-            if isinstance(entry, _GroupEntry):
-                for pipeline_in_group in entry:
-                    task_entry = self._get_task_entry(task_id, pipeline_in_group)
-                    if task_entry is not None:
-                        return task_entry
-            else:
-                if entry.task_id == task_id:
-                    return entry
-
-    def _mark_complete(self, task_id):
-        task_entry = self._get_task_entry(task_id)
-
-        # defensive
-        if task_entry is not None:
-            task_entry.mark_complete()
-
-    def _get_next_step(self, task_id, previous_task_failed: bool, pipeline=None):
-        # figure out the next step for the pipeline
-        # a group must be complete before you can move onto its continuation
-        # groups are executed in parallel so a pipeline_in_group that is complete should jump
-        # to the continuation of the group (if any) but only if the group as a whole is complete
-
-        if previous_task_failed:
-            # ignore the rest of the pipeline, but execute the "finally" task if it exists
-            finally_task = self._try_get_finally_task()
-            previous_task_was_finally = finally_task is not None and finally_task.task_id == task_id
-            next_task = None if previous_task_was_finally else finally_task
-            return None, next_task, None
-
-        iterator = iter(self._pipeline if pipeline is None else pipeline)
-
-        while True:
-            try:
-                entry = next(iterator)
-
-                if isinstance(entry, _GroupEntry):
-                    for pipeline_in_group in entry:
-                        current_t, next_t, _ = self._get_next_step(task_id, False, pipeline_in_group)
-
-                        if current_t is not None:
-
-                            if next_t is None:
-                                # at the end of pipeline_in_group so roll onto the next task but only if the group is complete
-                                next_t = _try_next(iterator) if entry.is_complete() else None
-
-                            return current_t, next_t, entry
-                else:
-                    if entry.task_id == task_id:
-                        next_entry = _try_next(iterator)
-                        return entry, next_entry, None
-
-            except StopIteration:
-                return None, None, None
-
-    def _try_get_finally_task(self):
-        return next((task for task in self._pipeline if isinstance(task, _TaskEntry) and task.is_finally), None)
-
-    def _save_group_result(self, group: _GroupEntry, caller_id, state: dict, task_result: TaskResult):
-        group_results = state.setdefault(group.group_id, {})
-        group_results[caller_id] = _GroupResult(task_result.data, task_result.content_type)
-        return group_results
-
-    def _aggregate_group_results(self, group: _GroupEntry, group_results: dict):
-
-        def aggregate_results(grp):
-            aggregated_results = []
-            for pipeline in grp:
-                last_task = pipeline[-1]
-                if isinstance(last_task, _GroupEntry):
-                    results = aggregate_results(last_task)
-                    aggregated_results.append(results)
-                else:
-                    group_result = group_results[pipeline[-1].task_id]
-                    aggregated_results.append(deserialise_result(group_result))
-            
-            return aggregated_results
-
-        aggregated_results = aggregate_results(group)
-
-        # ensure we send a tuple
-        aggregated_results = (aggregated_results,)
-
-        task_result = TaskResult(id=_gen_id())
-        try_serialise_json_then_pickle(task_result, aggregated_results)
-
-        return task_result
-
-    def _extend_args(self, args, task_args):
-        if any(task_args):
-            if _is_tuple(args):
-                args = args + (task_args,)
-            elif isinstance(args, list):
-                args.extend(task_args)
-            else:
-                args = (args) + (task_args,)
-
-        return args
+            context.pack_and_send(task.get_destination(), task_id, request)
 
     @staticmethod
     def _emit_result(context, task_request, task_result_or_exception):
+        # the result of this task is the result of the pipeline
+        key = 'task_result' if isinstance(task_result_or_exception, TaskResult) else 'task_exception'
+        context.pack_and_save(key, task_result_or_exception)
+
         # either send a message to egress if reply_topic was specified
         if task_request.HasField('reply_topic'):
             context.pack_and_send_egress(topic=task_request.reply_topic, value=task_result_or_exception)
@@ -175,38 +77,40 @@ class _Pipeline(object):
             caller_id = context.get_caller_id()
 
             if 'caller_id' in state and state['caller_id'] != caller_id:  # don't call back to self
-                context.pack_and_send(state['address'], state['caller_id'], task_result_or_exception)
+                context.pack_and_send(state['caller_address'], state['caller_id'], task_result_or_exception)
 
     def resume(self, context: _TaskContext, task_result_or_exception: Union[TaskResult, TaskException]):
         caller_id = context.get_caller_id()
         state = context.get_state()
 
         # mark pipeline step as complete
-        self._mark_complete(caller_id)
+        _mark_task_complete(caller_id, self._pipeline)
+
+        # record the task result / exception - returns current map of task_id to task_result
+        task_results =_save_task_result_or_exception(caller_id, state, task_result_or_exception)
 
         # save updated pipeline state
-        context.update_state({'pipeline': self._pipeline})
+        context.update_state({'pipeline': self.to_proto()})
 
         # get the next step of the pipeline to run (if any)
-        previous_task_failed = isinstance(task_result_or_exception, TaskException)
-        _, next_step, group = self._get_next_step(caller_id, previous_task_failed)
+        _, next_step, group = _get_next_step_in_pipeline(caller_id, self._pipeline)
 
-        # need to aggregate task results into group state
-        if group is not None:
-            # save each result from the pipeline
-            group_results = self._save_group_result(group, caller_id, state, task_result_or_exception)
+        # if the group is complete the create the aggregate results as a list
+        if group is not None and group.is_complete():
+            task_result_or_exception = _aggregate_group_results(group, task_results, self._serialiser)
 
-            # if the group is complete the create the aggregate results as a list
-            if group.is_complete():
-                task_result_or_exception = self._aggregate_group_results(group, group_results)
+        # if we got an exception then the next step is the finally_task if there is one (or none otherwise)
+        if isinstance(task_result_or_exception, TaskException):
+            next_step = _try_get_finally_task(caller_id, self._pipeline)
 
+        # turn next step into remainder of tasks to call
         if isinstance(next_step, _TaskEntry):
             remainder = [next_step]
             if next_step.is_finally:
                 # record the result of the task prior to the finally task so we can return it once the finally task completes
-                context.pack_and_update_state('result_before_finally', task_result_or_exception)
+                context.update_state({'result_before_finally': task_result_or_exception})
         elif isinstance(next_step, _GroupEntry):
-            remainder = self._get_initial_tasks(next_step)
+            remainder = _get_initial_tasks(next_step)
         else:
             remainder = []
 
@@ -214,104 +118,87 @@ class _Pipeline(object):
         if any(remainder):
 
             for task in remainder:
-                task_id, task_type, task_args, kwargs = task.to_tuple()
+                task_id, task_type, task_args, kwargs, parameters = task.to_tuple()
 
-                if isinstance(task_result_or_exception, TaskException):
-                    args = []
-                    content_type = 'application/json'
+                if task.is_finally:
+                    args, state = (), self._serialiser.from_proto(task_result_or_exception.state)
                 else:
-                    args = deserialise(task_result_or_exception)
-                    content_type = task_result_or_exception.content_type
+                    args, state = self._serialiser.deserialise_result(task_result_or_exception)
 
                 # extend with any args passed to the task explicitly
-                args = self._extend_args(args, task_args)
+                args = _extend_args(args, task_args)
 
-                task_data = (args, kwargs)
-
-                request = TaskRequest(id=task_id, type=task_type)
-
-                # honour the task_result content_type - pickled or protobuf data might not be json serialisable
-                serialise(request, task_data, content_type=content_type)
-
-                destination = self._get_destination(task)
-                context.pack_and_send(destination, task_id, request)
+                request = TaskRequest(id=task_id, type=task_type, parameters=self._serialiser.to_proto(parameters))
+                self._serialiser.serialise_request(request, args, kwargs, state)
+                
+                context.pack_and_send(task.get_destination(), task_id, request)
         else:
-            # if we are at the last step in the pipeline and it is complete then terminate and emit result
             last_step = self._pipeline[-1]
 
-            if last_step.is_complete() or isinstance(task_result_or_exception, TaskException):
+            if last_step.is_complete():
+                # if we are at the last step in the pipeline and it is complete then terminate and emit result
                 self.terminate(context, task_result_or_exception)
 
-    def attempt_retry(self, context: _TaskContext, task_exception: TaskException):
-        task_id = context.get_caller_id()
-        task_entry = self._get_task_entry(task_id)
+            elif isinstance(task_result_or_exception, TaskException):
+                if group is None or group.is_complete():
+                    # else if have an exception then terminate but waiting for any parallel tasks in the group to complete first
+                    self.terminate(context, task_result_or_exception)
 
-        # defensive
-        if task_entry is None:
-            return False
-
-        retries = context.get_state().get('retries', {})
-        retry_count = retries.get(task_id, 1)
-        retry_policy = task_entry.get_parameter('retry_policy')
-
-        if retry_policy is None:
-            return False
-
-        if retry_count > retry_policy.max_retries:
-            return False
-
-        delay = retry_policy.delay
-
-        if retry_policy.exponential_back_off:
-            delay_ms = int(delay.total_seconds() * 1000.0)
-            delay = timedelta(milliseconds=delay_ms ^ retry_count)
-
-        request = task_exception.retry_request
-        destination = context.get_caller_address()
-        if delay:
-            context.pack_and_send_after(delay, destination, task_id, request)
-        else:
-            context.pack_and_send(destination, task_id, request)
-
-        retries[task_id] = retry_count + 1
-        context.update_state({'retries': retries})
-
-        return True
 
     def terminate(self, context: _TaskContext, task_result_or_exception: Union[TaskResult, TaskException]):
         task_request = context.unpack('task_request', TaskRequest)
 
-        serialised_result_before_finally = context.get_state().get('result_before_finally')
-        if isinstance(task_result_or_exception, TaskResult) and serialised_result_before_finally is not None:
+        result_before_finally = context.get_state().get('result_before_finally')
+        if result_before_finally is not None and isinstance(task_result_or_exception, TaskResult):
             # finally ran successfully, so return the result of the previous task (rather than cleanup result from finally)
-            result_before_finally = TaskException() if TaskException.__name__ in serialised_result_before_finally.type_url else TaskResult()
-            serialised_result_before_finally.Unpack(result_before_finally)
             task_result_or_exception = result_before_finally
 
         # set basic message properties
-        task_result_or_exception.correlation_id = task_request.id
+        task_result_or_exception.id = task_request.id
         task_result_or_exception.type = f'{task_request.type}.' + (
             'result' if isinstance(task_result_or_exception, TaskResult) else 'error')
 
-        # pass back any request_state that we were given at the start of the pipeline
-        task_result_or_exception.request_state.CopyFrom(task_request.request_state)
-
-        # remove the retry_request if set because this is only used if we are retrying
-        if isinstance(task_result_or_exception, TaskException):
-            task_result_or_exception.ClearField('retry_request')
+        # pass back any state that we were given at the start of the pipeline
+        task_result_or_exception.state.CopyFrom(task_request.state)
 
         # finally emit the result (to egress, destination address or caller address)
         self._emit_result(context, task_request, task_result_or_exception)
 
 
-class PipelineBuilder():
+class PipelineBuilder(object):
+    """
+    Builder class for creating pipelines of Flink Tasks
+
+    :param optional pipeline: list of initial pipeline entries e.g. from another builder
+    """
     def __init__(self, pipeline: list = None):
         self._pipeline = [] if pipeline is None else pipeline
+        self._builder_id = _gen_id()
 
-    def append_to(self, other: 'PipelineBuilder'):
+    @property
+    def id(self):
+        """
+        The ID of this pipeline
+        """
+        return self._builder_id
+
+    def append_to(self, other: 'PipelineBuilder') -> 'PipelineBuilder':
+        """
+        Appends tasks from another pipeline builder into this one
+
+        :param other: the other pipeline builder
+        :return: the builder
+        """
         other._pipeline.extend(self._pipeline)
+        return self
 
-    def append_group(self, pipelines: Iterable['PipelineBuilder']):
+    def append_group(self, pipelines: Iterable['PipelineBuilder']) -> 'PipelineBuilder':
+        """
+        Appends tasks from another pipeline builder into a new in_parallel group inside this one
+
+        :param other: the other pipeline builder
+        :return: the builder
+        """
         group = _GroupEntry(_gen_id())
 
         for pipeline in pipelines:
@@ -323,79 +210,176 @@ class PipelineBuilder():
     def _add_to_group(self, group: _GroupEntry):
         group.add_to_group(self._pipeline)
 
-    def to_json_dict(self, verbose=False):
-        return [entry.to_json_dict(verbose) for entry in self._pipeline]
+    @staticmethod
+    def _unpack_single_tuple_args(args):
+        # send a single argument by itself instead of wrapped inside a tuple
+        if _is_tuple(args) and len(args) == 1:
+            args = args[0]
 
-    def to_json(self, verbose=False):
-        return [entry.to_json(verbose) for entry in self._pipeline]
+        return args
 
-    def send(self, fun, *args, **kwargs):
-        task_type = _task_type_for(fun)
-        self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(fun)))
+    def send(self, fun, *args, **kwargs) -> 'PipelineBuilder':
+        """
+        Adds a task entry for the given Flink Task and arguments
+
+        :param fun: the python function which should be decorated with @tasks.bind()
+        :param args: the task args
+        :param kwargs: the task kwargs
+        :return: the builder
+        """
+        args = self._unpack_single_tuple_args(args)
+        task_type, parameters = self._task_type_and_parameters_for(fun)
+        self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=parameters))
         return self
 
-    def set(self, **kwargs):
+    def set(self, retry_policy:RetryPolicy = None, **params) -> 'PipelineBuilder':
+        """
+        Sets task properties on the last entry added to the builder
+
+        :param option retry_policy: the task retry policy to use
+        :param params: any other parameters to the task
+        :return: the builder
+        """
+        if retry_policy is not None:
+            params['retry_policy'] = retry_policy.to_proto()
+
         if any(self._pipeline):
             entry = self._pipeline[-1]
-            entry.set_parameters(kwargs)
+            entry.set_parameters(params)
 
         return self
 
-    def continue_with(self, continuation, *args, **kwargs):
+    def continue_with(self, continuation, *args, **kwargs) -> 'PipelineBuilder':
+        """
+        Adds continuation to the pipeline
+
+        :param continuation: the python function which should be decorated with @tasks.bind()
+        :param args: the task args
+        :param kwargs: the task kwargs
+        :return: the builder
+        """
         if isinstance(continuation, PipelineBuilder):
             continuation.append_to(self)
         else:
-            task_type = _task_type_for(continuation)
-            self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(continuation)))
+            args = self._unpack_single_tuple_args(args)
+            task_type, parameters = self._task_type_and_parameters_for(continuation)
+            self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=parameters))
         return self
 
-    def is_single_task(self):
-        if len(self._pipeline) == 1:
-            if isinstance(self._pipeline[0], _TaskEntry):
-                return True
+    def get_inital_destination(self):
+        """
+        Returns the initial destination of the pipeline - i.e. where the first task should be sent
 
-        return False
+        :return: the initial desintation (e.g. example/worker)
+        """
+        return None if not any(self._pipeline) else self._pipeline[0].get_destination()
 
-    def to_task_request(self):
-        if self.is_single_task():
-            task = self._pipeline[0]
-            task_id, task_type, args, kwargs = task.to_tuple()
-            task_data = (args, kwargs)
-            serialiser = partial(serialise, data=task_data, content_type=task.get_parameter('content_type'))
-        else:
-            task_id = str(uuid4())
-            task_data = ((self._pipeline,), {})
-            task_type = '__builtins.run_pipeline'
-            serialiser = partial(try_serialise_json_then_pickle, data=task_data)
+    def to_task_request(self, serialiser) -> TaskRequest:
+        """
+        Serialises the pipeline as a TaskRequest with a task type of '__builtins.run_pipeline'
 
-        task_request = TaskRequest(id=task_id, type=task_type)
-        serialiser(task_request)
+        :param serialiser: the serialiser to use such as DefaultSerialiser
+        :return: TaskRequest protobuf message
+        """
+        task_id = self._builder_id
+        task_type = '__builtins.run_pipeline'
+        args = self.validate().to_proto(serialiser=serialiser)
+        kwargs = {}
+        parameters = {}    
+
+        # send a single argument by itself instead of wrapped inside a tuple
+        if _is_tuple(args) and len(args) == 1:
+            args = args[0]
+
+        task_request = TaskRequest(id=task_id, type=task_type, parameters=serialiser.to_proto(parameters))
+        serialiser.serialise_request(task_request, args, kwargs)
         
         return task_request
 
-    def finally_do(self, finally_action, *args, **kwargs):
-        task_type = _task_type_for(finally_action)
-        self._pipeline.append(
-            _TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(finally_action),
-                       is_finally=True))
+    def finally_do(self, finally_action, *args, **kwargs) -> 'PipelineBuilder':
+        """
+        Adds finally to the pipeline
+
+        :param continuation: the python function which should be decorated with @tasks.bind()
+        :param args: the task args
+        :param kwargs: the task kwargs
+        :return: the builder
+        """
+        args = self._unpack_single_tuple_args(args)
+        task_type, parameters = self._task_type_and_parameters_for(finally_action)
+        task_entry = _TaskEntry(_gen_id(), task_type, args, kwargs, parameters=parameters, is_finally=True)
+        task_entry.set_parameters({'is_fruitful': False})
+        self._pipeline.append(task_entry)
         return self
 
-    def to_pipeline(self):
-        error = self.validate()
-        if error:
-            raise ValueError(f'Invalid pipeline: {error}')
-        return _Pipeline(self._pipeline)
+    def to_pipeline(self, serialiser=None):
+        """
+        Concretises the builder into a pipeline
 
-    def validate(self):
+        :param option serialiser: the serialiser to use such as DefaultSerialiser
+        :return: a Flink Tasks pipeline
+        """
+        self.validate()
+        return _Pipeline(self._pipeline, serialiser=serialiser)
+
+    def validate(self) -> 'PipelineBuilder':
+        """
+        Validates the pipeline
+
+        :return: the builder
+        """
+        errors = []
+
+        for entry in self._pipeline:
+            entry.validate(errors)
+
         finally_tasks = [task for task in self._pipeline if isinstance(task, _TaskEntry) and task.is_finally]
         if len(finally_tasks) > 1:
-            return 'Cannot have more than one "finally_do" method.'
+            errors.append('Cannot have more than one "finally_do" method')
         if len(finally_tasks) == 1 and finally_tasks[0] != self._pipeline[-1]:
-            return 'finally_do must be called at the end of a pipeline'
+            errors.append('"finally_do" must be called at the end of a pipeline')
+        
+        if any(errors):
+            error = ', '.join(errors)
+            raise ValueError(f'Invalid pipeline: {error}')
+
+        return self
+
+    def to_proto(self, serialiser=None) -> Pipeline:
+        """
+        Serialises the pipeline to protobuf
+
+        :param serialiser: the serialiser to use such as DefaultSerialiser
+        :return: Pipeline protobuf message
+        """
+        return _Pipeline(self._pipeline, serialiser=serialiser).to_proto()
 
     @staticmethod
-    def _get_defaults(fun):
+    def from_proto(pipeline_proto: Pipeline, serialiser) -> 'PipelineBuilder':
+        """
+        Deserialises the pipeline from protobuf
+
+        :param pipeline_proto: the pipeline as protobuf
+        :param serialiser: the serialiser to use such as DefaultSerialiser
+        :return: Pipeline protobuf message
+        """
+        pipeline = []
+
+        for proto in pipeline_proto.entries:
+            if proto.HasField('task_entry'):
+                pipeline.append(_TaskEntry.from_proto(proto, serialiser))
+            elif proto.HasField('group_entry'):
+                pipeline.append(_GroupEntry.from_proto(proto, serialiser))
+
+        return PipelineBuilder(pipeline)
+
+    @staticmethod
+    def _task_type_and_parameters_for(fun):
         try:
-            return fun.defaults()
+            parameters = fun.defaults()
+            module_name = parameters.get('module_name', None)
+            task_type = _task_type_for(fun, module_name)
+
+            return task_type, parameters
         except AttributeError:
             raise AttributeError(f'Function {fun.__module__}.{fun.__name__} should be decorated with tasks.bind')

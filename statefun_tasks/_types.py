@@ -1,5 +1,8 @@
 from typing import NamedTuple
 from datetime import timedelta
+from google.protobuf.message import Message
+from .messages_pb2 import TaskEntry, GroupEntry, PipelineEntry, TaskRetryPolicy, Pipeline
+from ._utils import _type_name
 import json
 
 
@@ -22,8 +25,12 @@ class _TaskEntry(object):
         else:
             return None
 
+    def get_destination(self):
+        # task destination of form 'namespace/worker_name'
+        return f'{self.get_parameter("namespace")}/{self.get_parameter("worker_name")}'
+
     def to_tuple(self):
-        return self.task_id, self.task_type, self.args, self.kwargs
+        return self.task_id, self.task_type, self.args, self.kwargs, self.parameters
 
     def mark_complete(self):
         self.complete = True
@@ -31,17 +38,43 @@ class _TaskEntry(object):
     def is_complete(self):
         return self.complete
 
-    def to_json_dict(self, verbose=False):
-        return json.loads(self.to_json(verbose))
+    def validate(self, errors):
+        if self.get_parameter('namespace') is None:
+            errors.append(f'task {self.task_type} [{self.task_id}] is missing "namespace"')
 
-    def to_json(self, verbose=False):
-        if verbose:
-            return json.dumps(self.__dict__, default=lambda o: str(o))
-        else:
-            return json.dumps({
-                'task_id': self.task_id,
-                'task_type': self.task_type
-            })
+        if self.get_parameter('worker_name') is None:
+            errors.append(f'task {self.task_type} [{self.task_id}] is missing "worker_name"')
+
+    def to_proto(self, serialiser) -> PipelineEntry:
+        proto = TaskEntry(
+            task_id=self.task_id, 
+            task_type=self.task_type, 
+            complete=self.complete, 
+            is_finally=self.is_finally)
+        
+        request = serialiser.serialise_args_and_kwargs(self.args, self.kwargs)
+        proto.request.CopyFrom(request)
+
+        if self.parameters is not None:
+            proto.parameters.CopyFrom(serialiser.to_proto(self.parameters))
+        
+        return PipelineEntry(task_entry=proto)
+
+    @staticmethod 
+    def from_proto(proto: PipelineEntry, serialiser):
+        args, kwargs = serialiser.deserialise_args_and_kwargs(proto.task_entry.request)
+
+        entry = _TaskEntry(
+            task_id=proto.task_entry.task_id, 
+            task_type=proto.task_entry.task_type, 
+            args=args, 
+            kwargs=kwargs, 
+            parameters=serialiser.from_proto(proto.task_entry.parameters), 
+            is_finally=proto.task_entry.is_finally)
+
+        entry.complete = proto.task_entry.complete
+
+        return entry
 
     def __repr__(self):
         return self.task_id
@@ -58,6 +91,9 @@ class _GroupEntry(object):
     def get_parameter(self, parameter_name):
         return None
 
+    def get_destination(self):
+        return None  # _GroupEntries don't have a single destination
+
     def add_to_group(self, tasks):
         self._group.append(tasks)
 
@@ -70,27 +106,62 @@ class _GroupEntry(object):
     def is_complete(self):
         return all(entry.is_complete() for entries in self._group for entry in entries)
 
-    def to_json_dict(self, verbose=False):
-        return {
-            'group_id': self.group_id,
-            'group': [[entry.to_json_dict(verbose) for entry in entries] for entries in self._group]
-        }
+    def validate(self, errors):
+        for entries in self._group:
+            for entry in entries:
+                entry.validate(errors)
 
-    def to_json(self, verbose=False):
-        return json.dumps(self.to_json_dict(verbose=verbose))
+    def to_proto(self, serialiser) -> PipelineEntry:
+        proto = GroupEntry(group_id=self.group_id)
+
+        for entries in self._group:
+            pipeline = Pipeline()
+
+            for entry in entries:
+                entry_proto = entry.to_proto(serialiser)
+                pipeline.entries.append(entry_proto)
+
+            proto.group.append(pipeline)
+
+        return PipelineEntry(group_entry=proto)
+
+    @staticmethod 
+    def from_proto(proto: PipelineEntry, serialiser):
+        entry = _GroupEntry(group_id=proto.group_entry.group_id)
+
+        group = []
+        for pipeline in proto.group_entry.group:
+            entries = []
+            
+            for proto in pipeline.entries:
+                if proto.HasField('task_entry'):
+                    entries.append(_TaskEntry.from_proto(proto, serialiser))
+                elif proto.HasField('group_entry'):
+                    entries.append(_GroupEntry.from_proto(proto, serialiser))
+
+            group.append(entries)
+
+        entry._group = group
+        return entry
 
     def __repr__(self):
         return self._group.__repr__()
 
 
-class _GroupResult(object):
-    def __init__(self, data, content_type):
-        self.data = data
-        self.content_type = content_type
-
-
-class TaskRetryPolicy(NamedTuple):
+class RetryPolicy(NamedTuple):
     retry_for: list = [Exception]
     max_retries: int = 1
     delay: timedelta = timedelta()
     exponential_back_off: bool = False
+
+    def to_proto(self):
+        return TaskRetryPolicy(
+            retry_for=[_type_name(ex) for ex in self.retry_for],
+            max_retries=self.max_retries, 
+            delay_ms=self.delay.total_seconds() * 1000, 
+            exponential_back_off=self.exponential_back_off)
+
+
+class TaskAlreadyExistsException(Exception):
+    def __init__(self, message):
+        super().__init__(message)
